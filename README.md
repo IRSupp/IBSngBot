@@ -6,9 +6,11 @@
 
 نصب یک‌خطه · به‌روزرسانی با یک کلیک · مدیریت آسان
 
-[![Telegram Channel](https://img.shields.io/badge/کانال-@irsuppchannel-229ED9?style=flat&logo=telegram&logoColor=white)](https://t.me/irsuppchannel)
-[![Support](https://img.shields.io/badge/پشتیبانی_و_خرید-@irsupplm__bot-229ED9?style=flat&logo=telegram&logoColor=white)](https://t.me/irsupplm_bot)
-[![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?style=flat&logo=docker&logoColor=white)](https://hub.docker.com/)
+[![Telegram Channel](https://img.shields.io/badge/کانال-@irsuppchannel-229ED9?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/irsuppchannel)
+[![Support](https://img.shields.io/badge/پشتیبانی_و_خرید-@irsupplm__bot-229ED9?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/irsupplm_bot)
+
+[![Docker Image](https://img.shields.io/badge/Docker_Hub-ibsngbot-2496ED?style=flat&logo=docker&logoColor=white)](https://hub.docker.com/r/boroumandhosein/ibsngbot/tags)
+[![Platform](https://img.shields.io/badge/Ubuntu_%7C_Debian-supported-E95420?style=flat&logo=linux&logoColor=white)](#-پیشنیازها)
 
 </div>
 
@@ -20,8 +22,12 @@
 - [نصب سریع](#-نصب-سریع-یکخطه)
 - [منوی مدیریت](#-منوی-مدیریت)
 - [به‌روزرسانی به آخرین نسخه](#-بهروزرسانی-به-آخرین-نسخه)
+- [نصب یا تغییر به یک نسخه‌ی خاص](#-نصب-یا-تغییر-به-یک-نسخهی-خاص)
+- [بازگشت به نسخه‌ی قبلی](#-بازگشت-به-نسخهی-قبلی-rollback)
+- [پشتیبان‌گیری و بازیابی دیتابیس](#-پشتیبانگیری-و-بازیابی-دیتابیس)
 - [مدیریت با دستورات داکر](#-مدیریت-با-دستورات-داکر-پیشرفته)
 - [رفع اشکال رایج](#-رفع-اشکال-رایج)
+- [پرسش‌های پرتکرار](#-پرسشهای-پرتکرار)
 - [پشتیبانی](#-پشتیبانی)
 
 ---
@@ -82,6 +88,85 @@ bash <(curl -fsSL https://raw.githubusercontent.com/IRSupp/IBSngBot/main/IRSupp-
 سپس: **بخش ۲ (ربات) → گزینه‌ی Update**
 
 > ✅ دیتابیس و تنظیمات شما دست‌نخورده می‌مانند؛ فقط کد ربات به نسخه‌ی جدید ارتقا می‌یابد.
+
+---
+
+## 🎯 نصب یا تغییر به یک نسخه‌ی خاص
+
+به‌طور پیش‌فرض همیشه آخرین نسخه (`latest`) نصب می‌شود. اگر بخواهید نسخه‌ی مشخصی را نصب کنید (مثلاً برای پایداری یا هماهنگی با راهنما)، از تگ نسخه استفاده کنید.
+
+**۱) دیدن نسخه‌های موجود:**
+
+فهرست کامل نسخه‌ها در داکرهاب:
+👉 https://hub.docker.com/r/boroumandhosein/ibsngbot/tags
+
+**۲) نصب یک نسخه‌ی خاص (مثلاً `1.0.5`):**
+
+```bash
+# نسخه‌ی موردنظر را بکشید
+docker pull boroumandhosein/ibsngbot:1.0.5
+
+# آن را به‌عنوان نسخه‌ی فعال علامت بزنید
+docker tag boroumandhosein/ibsngbot:1.0.5 boroumandhosein/ibsngbot:latest
+
+# کانتینر فعلی را بردارید و از منوی اسکریپت، بخش ربات → Restart (یا Update) را بزنید
+docker rm -f ibsng_bot_app
+```
+
+سپس اسکریپت نصب را باز کنید و **بخش ۲ (ربات) → Restart** را بزنید تا با همان تنظیمات، نسخه‌ی انتخابی بالا بیاید.
+
+> 💡 شماره‌ی نسخه را جایگزین `1.0.5` کنید. مثلاً برای نسخه‌ی `1.1.0`:
+> `docker pull boroumandhosein/ibsngbot:1.1.0`
+
+**۳) دیدن نسخه‌ی نصب‌شده‌ی فعلی:**
+
+```bash
+docker inspect --format '{{.Config.Image}}' ibsng_bot_app
+docker images | grep ibsngbot
+```
+
+---
+
+## ↩️ بازگشت به نسخه‌ی قبلی (Rollback)
+
+اگر بعد از یک به‌روزرسانی مشکلی پیش آمد، به‌راحتی به نسخه‌ی قبلی برگردید:
+
+```bash
+# نسخه‌ی سالمِ قبلی را بکشید (شماره را جایگزین کنید)
+docker pull boroumandhosein/ibsngbot:1.0.4
+
+# آن را نسخه‌ی فعال کنید
+docker tag boroumandhosein/ibsngbot:1.0.4 boroumandhosein/ibsngbot:latest
+
+# کانتینر را بازسازی کنید
+docker rm -f ibsng_bot_app
+```
+
+سپس از منوی اسکریپت، بخش ربات → **Restart** را بزنید.
+
+> ✅ دیتابیس و تنظیمات شما در rollback هم دست‌نخورده می‌مانند.
+
+---
+
+## 💾 پشتیبان‌گیری و بازیابی دیتابیس
+
+پیش از هر به‌روزرسانی مهم، یک پشتیبان بگیرید. دیتابیس داخل کانتینر `ibsng_bot_db` است.
+
+**تهیه‌ی پشتیبان:**
+
+```bash
+docker exec ibsng_bot_db pg_dump -U ibsng_bot ibsng_bot > backup_$(date +%F).sql
+```
+
+فایلی مثل `backup_2026-01-15.sql` در پوشه‌ی فعلی ساخته می‌شود.
+
+**بازیابی از پشتیبان:**
+
+```bash
+cat backup_2026-01-15.sql | docker exec -i ibsng_bot_db psql -U ibsng_bot -d ibsng_bot
+```
+
+> 💡 فایل پشتیبان را جایی امن (خارج از سرور) نگه دارید.
 
 ---
 
@@ -181,6 +266,57 @@ docker system prune -f     # حذف موارد بدون‌استفاده‌ی د
 ```bash
 systemctl restart docker
 ```
+
+</details>
+
+---
+
+## ❓ پرسش‌های پرتکرار
+
+<details>
+<summary><b>آیا با به‌روزرسانی، اطلاعات و تنظیماتم پاک می‌شود؟</b></summary>
+
+<br>
+
+نه. دیتابیس و تنظیمات شما در یک بخش جدا (volume) ذخیره می‌شوند و در به‌روزرسانی، rollback و ری‌استارت دست‌نخورده می‌مانند. فقط کد ربات عوض می‌شود.
+
+</details>
+
+<details>
+<summary><b>هر چند وقت باید به‌روزرسانی کنم؟</b></summary>
+
+<br>
+
+هر وقت نسخه‌ی جدیدی در [کانال](https://t.me/irsuppchannel) اعلام شد. به‌روزرسانی اختیاری است ولی نسخه‌های جدید معمولاً رفع اشکال و قابلیت تازه دارند.
+
+</details>
+
+<details>
+<summary><b>چند ادمین می‌توانم داشته باشم؟</b></summary>
+
+<br>
+
+محدودیتی ندارد. آیدی عددی ادمین‌ها را با کاما در فایل تنظیمات وارد کنید (مثال: `111111,222222`)، سپس ربات را از منوی اسکریپت **Restart** کنید. ادمین‌های با نقش محدود را هم می‌توانید از داخل خودِ ربات، بخش «مدیریت ادمین‌ها» اضافه کنید.
+
+</details>
+
+<details>
+<summary><b>چطور بفهمم چه نسخه‌ای نصب است؟</b></summary>
+
+<br>
+
+```bash
+docker inspect --format '{{.Config.Image}}' ibsng_bot_app
+```
+
+</details>
+
+<details>
+<summary><b>ربات و IBSng روی یک سرور هستند یا جدا؟</b></summary>
+
+<br>
+
+می‌توانند روی یک سرور باشند. اسکریپت نصب هر دو را جداگانه مدیریت می‌کند و ربات به‌صورت خودکار به IBSng محلی وصل می‌شود.
 
 </details>
 
