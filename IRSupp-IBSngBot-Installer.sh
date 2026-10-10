@@ -22,7 +22,7 @@ err()  { echo -e "${R}❌ $1${N}"; }
 
 # ── images ──
 IBSNG_IMAGE="boroumandhosein/ibsng-irsupp:latest"
-BOT_IMAGE="boroumandhosein/ibsngbot:1.1.2"
+BOT_IMAGE="boroumandhosein/ibsngbot:latest"
 
 # ── IBSng container ──
 IBSNG_CONTAINER="ibsng"
@@ -70,12 +70,17 @@ container_running() { docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$1
 
 # Read the image tag a container was created from (e.g. "1.0.2" or "latest").
 installed_version() {
-    local c="$1" img
+    local c="$1" img version
+    version="$(docker inspect --format '{{index .Config.Labels "bot.version"}}' "$c" 2>/dev/null || true)"
+    if [[ "$version" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "$version"; return
+    fi
     img="$(docker inspect --format '{{.Config.Image}}' "$c" 2>/dev/null || true)"
     [ -z "$img" ] && { echo "unknown"; return; }
     case "$img" in
+        *@sha256:*) echo "unknown (digest pinned)" ;;
         *:*) echo "${img##*:}" ;;
-        *)   echo "latest" ;;
+        *) echo "unknown" ;;
     esac
 }
 
@@ -529,7 +534,7 @@ bot_menu() {
         echo "  2) Status"
         echo "  3) Live Log"
         echo "  4) Restart"
-        echo "  5) Update to 1.1.2 (automatic backup)"
+        echo "  5) Check / Update bot (automatic backup)"
         echo "  6) Delete (keeps data volume)"
         echo "  7) Back"
         echo ""
@@ -563,7 +568,7 @@ bot_delete() {
     pause
 }
 
-safe_bot_update_112() (
+safe_bot_update() (
     set -euo pipefail
     if [ "$(id -u)" -ne 0 ]; then
         echo "Run with sudo/root." >&2; exit 1
@@ -581,6 +586,7 @@ import hashlib
 import http.client
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import signal
@@ -590,7 +596,11 @@ import sys
 import time
 import urllib.parse
 
-TARGET = 'boroumandhosein/ibsngbot@sha256:9fc3d7df0c800d1f33993398f742d5cc5fb5793925a1d5cb2a562e48d9d0a524'
+# Release contract: publish stable X.Y.Z as latest with bot.version metadata.
+# Automatic application rollback requires backward-compatible DB migrations;
+# the updater never restores an older DB snapshot over subsequent purchases.
+REPOSITORY = 'boroumandhosein/ibsngbot'
+LATEST = REPOSITORY + ':latest'
 BOT = 'ibsng_bot_app'
 DB = 'ibsng_bot_db'
 ENV_FILE = Path('/opt/ibsng_bot/bot.env')
@@ -660,14 +670,51 @@ def preflight(old, db):
     return env
 
 
-def replacement_config(old, image):
+def version_tuple(value):
+    if not re.fullmatch(r'v?\d+\.\d+\.\d+', value or ''):
+        return None
+    return tuple(int(part) for part in value.lstrip('v').split('.'))
+
+
+def current_version(old):
+    label = (old['Config'].get('Labels') or {}).get('bot.version')
+    env = environment(old['Config']).get('BOT_VERSION')
+    tag = old['Config'].get('Image', '').rsplit(':', 1)[-1]
+    return next((v for v in (label, env, tag) if version_tuple(v) is not None), 'unknown')
+
+
+def release_details(image):
+    version = (image['Config'].get('Labels') or {}).get('bot.version', '')
+    if version_tuple(version) is None:
+        raise RuntimeError('Latest image is missing a stable bot.version label (example: 1.2.0).')
+    refs = image.get('RepoDigests') or []
+    target = next((ref for ref in refs if re.fullmatch(re.escape(REPOSITORY) +
+                  r'@sha256:[0-9a-f]{64}', ref)), None)
+    if not target:
+        raise RuntimeError('Could not pin the downloaded release digest; no containers changed.')
+    return version, target
+
+
+def confirm_update(current, latest):
+    # stdin contains this embedded Python program, so prompts must use the TTY.
+    try:
+        with open('/dev/tty', 'r') as reader, open('/dev/tty', 'w') as terminal:
+            terminal.write('Update ' + current + ' -> ' + latest +
+                           ' with automatic backup? [y/N]: ')
+            terminal.flush()
+            return reader.readline().strip().lower() in ('y', 'yes')
+    except OSError:
+        raise RuntimeError('An interactive terminal is required to confirm the update.')
+
+
+def replacement_config(old, image, target, version):
     body = copy.deepcopy(old['Config'])
-    body['Image'] = TARGET
+    body['Image'] = target
     # Retain all customer settings; only image-generated version metadata changes.
     body['Env'] = [v for v in body['Env'] if not v.startswith('BOT_VERSION=')]
-    body['Env'].append('BOT_VERSION=1.1.2')
+    body['Env'].append('BOT_VERSION=' + version)
     body['Labels'] = dict(body.get('Labels') or {})
-    body['Labels']['bot.version'] = '1.1.2'
+    body['Labels']['bot.version'] = version
     body['Entrypoint'] = image['Config']['Entrypoint']
     body['Cmd'] = image['Config'].get('Cmd')
     body['HostConfig'] = copy.deepcopy(old['HostConfig'])
@@ -712,11 +759,25 @@ def update():
     # Keep a reference before pulling: moving a tag can hide the old image in
     # Docker's containerd store even while the old container still exists.
     run('image', 'tag', old['Image'], rollback_tag)
-    print('Downloading verified 1.1.2 image...', flush=True)
-    run('pull', TARGET)
-    image = inspect(TARGET)
-    if image['Config'].get('Labels', {}).get('bot.version') != '1.1.2':
-        raise RuntimeError('Unexpected image version; no changes made.')
+    installed = current_version(old)
+    print('Installed version: ' + installed, flush=True)
+    print('Checking/downloading the release published as latest (bot stays running)...', flush=True)
+    run('pull', LATEST)
+    image = inspect(LATEST)
+    version, target = release_details(image)
+    print('Latest published version: ' + version, flush=True)
+    print('Installed build: ' + old['Image'].replace('sha256:', '')[:12] +
+          '\nAvailable build: ' + image['Id'].replace('sha256:', '')[:12], flush=True)
+    if old['Image'] == image['Id']:
+        print('Already up to date. No restart or database changes needed.', flush=True)
+        return
+    if version_tuple(installed) is not None and version_tuple(version) < version_tuple(installed):
+        raise RuntimeError('The latest tag is older than the installed version. Automatic downgrade refused.')
+    if installed == version:
+        print('Same version number, different image build.', flush=True)
+    if not confirm_update(installed, version):
+        print('Cancelled. Existing bot and database were not changed.', flush=True)
+        return
     backup = BACKUPS / (stamp + '-' + str(os.getpid()))
     backup.mkdir(mode=0o700)
     for filename, data in [('bot-inspect.json', old), ('db-inspect.json', db)]:
@@ -724,7 +785,10 @@ def update():
     shutil.copy2(ENV_FILE, backup / 'bot.env')
     os.chmod(backup / 'bot.env', 0o600)
     (backup / 'effective-env.json').write_text(json.dumps(env, indent=2))
-    rollback_name = BOT + '_before_1_1_2_' + stamp
+    rollback_name = BOT + '_before_update_' + stamp
+    (backup / 'release.json').write_text(json.dumps({
+        'previous_version': installed, 'new_version': version, 'target_digest': target,
+        'new_image_id': image['Id'], 'previous_image_id': old['Image']}, indent=2))
     (backup / 'recovery.txt').write_text(
         'Original container ID: ' + old['Id'] + '\nOriginal image: ' + old['Image'] +
         '\nRetained image tag: ' + rollback_tag + '\nRetained container name: ' + rollback_name +
@@ -761,11 +825,11 @@ def update():
         run('update', '--restart=no', old['Id'], stdout=subprocess.DEVNULL)
         renamed = True
         run('rename', old['Id'], rollback_name)
-        new_id = create_container(replacement_config(old, image), BOT)
+        new_id = create_container(replacement_config(old, image, target, version), BOT)
         run('start', new_id, stdout=subprocess.DEVNULL)
         check_ready(new_id, backup)
-        (backup / 'SUCCESS').write_text('Updated to 1.1.2; previous container retained stopped.\n')
-        print('SUCCESS: version 1.1.2 is ready. Backup: ' + str(backup), flush=True)
+        (backup / 'SUCCESS').write_text('Updated to ' + version + '; previous container retained stopped.\n')
+        print('SUCCESS: version ' + version + ' is ready. Backup: ' + str(backup), flush=True)
     except BaseException:
         print('Update failed. Restoring the previous container...', file=sys.stderr, flush=True)
         # If create succeeded but its response was interrupted, recover its ID by name.
@@ -815,8 +879,8 @@ IRSUPP_UPDATE_PYTHON
 )
 
 bot_update() {
-    if safe_bot_update_112; then
-        ok "Updated to 1.1.2; verified backup path is shown above."
+    if safe_bot_update; then
+        info "Update check finished. The result is shown above."
     else
         err "Update did not complete. Read the error above; do not reinstall."
     fi
