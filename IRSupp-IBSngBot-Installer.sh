@@ -22,7 +22,7 @@ err()  { echo -e "${R}❌ $1${N}"; }
 
 # ── images ──
 IBSNG_IMAGE="boroumandhosein/ibsng-irsupp:latest"
-BOT_IMAGE="boroumandhosein/ibsngbot:latest"
+BOT_IMAGE="boroumandhosein/ibsngbot:1.1.2"
 
 # ── IBSng container ──
 IBSNG_CONTAINER="ibsng"
@@ -207,6 +207,14 @@ ibsng_install() {
 # ═══════════════════════════════════════════════════════════════
 
 bot_install() {
+    # Never regenerate FERNET_KEY/passwords over an existing installation.
+    if [ -e "$BOT_ENV_FILE" ] || container_exists "$BOT_CONTAINER" || \
+       container_exists "$BOT_DB_CONTAINER" || \
+       docker volume inspect "$BOT_DB_VOLUME" >/dev/null 2>&1; then
+        err "Existing bot settings/data found. Use option 5 (safe update); do not reinstall."
+        pause
+        return
+    fi
     install_docker
 
     echo ""
@@ -521,7 +529,7 @@ bot_menu() {
         echo "  2) Status"
         echo "  3) Live Log"
         echo "  4) Restart"
-        echo "  5) Update (pull latest image)"
+        echo "  5) Update to 1.1.2 (automatic backup)"
         echo "  6) Delete (keeps data volume)"
         echo "  7) Back"
         echo ""
@@ -555,52 +563,262 @@ bot_delete() {
     pause
 }
 
+safe_bot_update_112() (
+    set -euo pipefail
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "Run with sudo/root." >&2; exit 1
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "Python 3 is required. Install python3, then run this updater again." >&2; exit 1
+    fi
+    command -v docker >/dev/null 2>&1 || { echo "Docker is missing." >&2; exit 1; }
+    python3 - <<'IRSUPP_UPDATE_PYTHON'
+"""Embedded by build_package.py; uses only Python's standard library."""
+import copy
+import datetime
+import fcntl
+import hashlib
+import http.client
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.parse
+
+TARGET = 'boroumandhosein/ibsngbot@sha256:9fc3d7df0c800d1f33993398f742d5cc5fb5793925a1d5cb2a562e48d9d0a524'
+BOT = 'ibsng_bot_app'
+DB = 'ibsng_bot_db'
+ENV_FILE = Path('/opt/ibsng_bot/bot.env')
+BACKUPS = Path('/var/backups/ibsng-bot')
+SOCKET = '/var/run/docker.sock'
+WAIT_SECONDS = 180
+ROLLBACK_REPOSITORY = 'irsupp-bot-rollback'
+
+
+def run(*args, **kwargs):
+    return subprocess.run(['docker', *args], check=True, **kwargs)
+
+
+def inspect(name):
+    return json.loads(run('inspect', name, capture_output=True).stdout)[0]
+
+
+def environment(config):
+    return dict(item.split('=', 1) for item in config.get('Env', []) if '=' in item)
+
+
+class DockerConnection(http.client.HTTPConnection):
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(120)
+        self.sock.connect(SOCKET)
+
+
+def create_container(body, name):
+    # Docker Engine's create API preserves HostConfig directly, including limits,
+    # logging, restart policy and security options; no lossy CLI reconstruction.
+    conn = DockerConnection('localhost', timeout=120)
+    try:
+        conn.request('POST', '/containers/create?name=' + urllib.parse.quote(name),
+                     json.dumps(body), {'Content-Type': 'application/json'})
+        response = conn.getresponse()
+        payload = json.loads(response.read())
+        if response.status != 201:
+            raise RuntimeError('Docker could not create the replacement container; old container retained.')
+        return payload['Id']
+    finally:
+        conn.close()
+
+
+def preflight(old, db):
+    env = environment(old['Config'])
+    if not old['State']['Running'] or not db['State']['Running']:
+        raise RuntimeError('Both existing bot and database must be running before updating.')
+    if old['HostConfig']['NetworkMode'] != 'host' or old['Mounts']:
+        raise RuntimeError('Custom network/mount installation: no changes made. Requires a tailored update.')
+    if old['HostConfig'].get('AutoRemove') or old['Config'].get('Labels', {}).get('com.docker.compose.project'):
+        raise RuntimeError('This updater supports the IRSupp installer, not Compose/auto-remove installations.')
+    for key in ('BOT_TOKEN', 'FERNET_KEY', 'HARDWARE_ID', 'DB_USER', 'DB_PASS', 'DB_NAME'):
+        if not env.get(key):
+            raise RuntimeError('Required existing setting missing: ' + key)
+    if env.get('DB_HOST') not in ('127.0.0.1', 'localhost'):
+        raise RuntimeError('External database installation is not supported by this updater.')
+    ports = db['NetworkSettings']['Ports'].get('5432/tcp') or []
+    if not any(p['HostPort'] == env.get('DB_PORT', '5432') and
+               p['HostIp'] in ('127.0.0.1', '0.0.0.0') for p in ports):
+        raise RuntimeError('Database port does not match the existing bot. Aborting.')
+    if not any(m['Destination'] == '/var/lib/postgresql/data' and m['Type'] in ('volume', 'bind')
+               for m in db['Mounts']):
+        raise RuntimeError('Persistent PostgreSQL storage could not be verified.')
+    if not ENV_FILE.is_file():
+        raise RuntimeError('Original bot.env is missing; restore it before updating.')
+    return env
+
+
+def replacement_config(old, image):
+    body = copy.deepcopy(old['Config'])
+    body['Image'] = TARGET
+    # Retain all customer settings; only image-generated version metadata changes.
+    body['Env'] = [v for v in body['Env'] if not v.startswith('BOT_VERSION=')]
+    body['Env'].append('BOT_VERSION=1.1.2')
+    body['Labels'] = dict(body.get('Labels') or {})
+    body['Labels']['bot.version'] = '1.1.2'
+    body['Entrypoint'] = image['Config']['Entrypoint']
+    body['Cmd'] = image['Config'].get('Cmd')
+    body['HostConfig'] = copy.deepcopy(old['HostConfig'])
+    return body
+
+
+def check_ready(cid, backup):
+    deadline = time.monotonic() + WAIT_SECONDS
+    ready_since = None
+    while time.monotonic() < deadline:
+        state = inspect(cid)
+        logs = run('logs', cid, capture_output=True)
+        output = logs.stdout + logs.stderr
+        (backup / 'new-container.log').write_bytes(output)
+        if not state['State']['Running'] or state.get('RestartCount', 0):
+            raise RuntimeError('New bot exited or restarted. Check the private backup log (including licensing).')
+        if 'وضعیت لایسنس: نامعتبر'.encode() in output or 'ربات قفل است'.encode() in output:
+            raise RuntimeError('License validation failed. Previous bot will be restored; contact the license manager.')
+        if b'Application started' in output and 'وضعیت لایسنس: معتبر'.encode() in output:
+            ready_since = ready_since or time.monotonic()
+            if time.monotonic() - ready_since >= 20:
+                return
+        time.sleep(2)
+    raise RuntimeError('Bot readiness was not confirmed; check licensing/startup in the private backup log.')
+
+
+def update():
+    os.umask(0o077)
+    if os.geteuid() != 0:
+        raise RuntimeError('Run this script with sudo/root.')
+    # Prevent Docker CLI and Unix API targeting different daemons.
+    for key in ('DOCKER_HOST', 'DOCKER_CONTEXT', 'DOCKER_TLS_VERIFY', 'DOCKER_CERT_PATH'):
+        os.environ.pop(key, None)
+    os.environ['DOCKER_HOST'] = 'unix://' + SOCKET
+    BACKUPS.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock = open(BACKUPS / '.update.lock', 'a')
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    old, db = inspect(BOT), inspect(DB)
+    env = preflight(old, db)
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    rollback_tag = ROLLBACK_REPOSITORY + ':' + stamp.lower() + '-' + str(os.getpid())
+    # Keep a reference before pulling: moving a tag can hide the old image in
+    # Docker's containerd store even while the old container still exists.
+    run('image', 'tag', old['Image'], rollback_tag)
+    print('Downloading verified 1.1.2 image...', flush=True)
+    run('pull', TARGET)
+    image = inspect(TARGET)
+    if image['Config'].get('Labels', {}).get('bot.version') != '1.1.2':
+        raise RuntimeError('Unexpected image version; no changes made.')
+    backup = BACKUPS / (stamp + '-' + str(os.getpid()))
+    backup.mkdir(mode=0o700)
+    for filename, data in [('bot-inspect.json', old), ('db-inspect.json', db)]:
+        (backup / filename).write_text(json.dumps(data, indent=2))
+    shutil.copy2(ENV_FILE, backup / 'bot.env')
+    os.chmod(backup / 'bot.env', 0o600)
+    (backup / 'effective-env.json').write_text(json.dumps(env, indent=2))
+    rollback_name = BOT + '_before_1_1_2_' + stamp
+    (backup / 'recovery.txt').write_text(
+        'Original container ID: ' + old['Id'] + '\nOriginal image: ' + old['Image'] +
+        '\nRetained image tag: ' + rollback_tag + '\nRetained container name: ' + rollback_name +
+        '\nDo not run two bot containers together. Stop the new bot before starting the old one.\n'
+        'The database is never automatically restored: doing so could erase later purchases.\n'
+        'database.dump is a PostgreSQL custom-format dump. bot.env and inspect files contain secrets.\n')
+    # Preserve the old image even if somebody later prunes unused images.
+    run('image', 'save', '-o', str(backup / 'previous-image.tar'), rollback_tag)
+    stopped = False
+    new_id = None
+    renamed = False
+    policy_changed = False
+    try:
+        print('Stopping bot briefly and backing up PostgreSQL...', flush=True)
+        stopped = True  # also recover if stop is interrupted after reaching Docker
+        run('stop', '-t', '90', old['Id'], stdout=subprocess.DEVNULL)
+        dump_env = dict(os.environ, PGPASSWORD=env['DB_PASS'])
+        with open(backup / 'database.dump', 'wb') as out:
+            run('exec', '-e', 'PGPASSWORD', DB, 'pg_dump', '-h', '127.0.0.1',
+                '-U', env['DB_USER'], '-d', env['DB_NAME'], '-Fc', stdout=out, env=dump_env)
+        with open(backup / 'database.dump', 'rb') as source:
+            run('exec', '-i', DB, 'pg_restore', '--list', stdin=source, stdout=subprocess.DEVNULL)
+        if (backup / 'database.dump').stat().st_size < 100:
+            raise RuntimeError('Database backup is unexpectedly empty.')
+        sums = []
+        for p in sorted(backup.iterdir()):
+            digest = hashlib.sha256()
+            with p.open('rb') as source:
+                for block in iter(lambda: source.read(1024 * 1024), b''):
+                    digest.update(block)
+            sums.append(digest.hexdigest() + '  ' + p.name)
+        (backup / 'SHA256SUMS').write_text('\n'.join(sums) + '\n')
+        policy_changed = True
+        run('update', '--restart=no', old['Id'], stdout=subprocess.DEVNULL)
+        renamed = True
+        run('rename', old['Id'], rollback_name)
+        new_id = create_container(replacement_config(old, image), BOT)
+        run('start', new_id, stdout=subprocess.DEVNULL)
+        check_ready(new_id, backup)
+        (backup / 'SUCCESS').write_text('Updated to 1.1.2; previous container retained stopped.\n')
+        print('SUCCESS: version 1.1.2 is ready. Backup: ' + str(backup), flush=True)
+    except BaseException:
+        print('Update failed. Restoring the previous container...', file=sys.stderr, flush=True)
+        # If create succeeded but its response was interrupted, recover its ID by name.
+        if renamed and not new_id:
+            try:
+                candidate = inspect(BOT)
+                if candidate['Id'] != old['Id']:
+                    new_id = candidate['Id']
+            except subprocess.CalledProcessError:
+                pass
+        if new_id:
+            run('rm', '-f', new_id, stdout=subprocess.DEVNULL)
+        if renamed:
+            # Query current name to also handle interrupted/failed rename calls.
+            if inspect(old['Id'])['Name'] != '/' + BOT:
+                run('rename', old['Id'], BOT)
+        if policy_changed:
+            policy = old['HostConfig']['RestartPolicy']
+            value = policy['Name'] or 'no'
+            if value == 'on-failure' and policy.get('MaximumRetryCount'):
+                value += ':' + str(policy['MaximumRetryCount'])
+            run('update', '--restart=' + value, old['Id'], stdout=subprocess.DEVNULL)
+        if stopped:
+            run('start', old['Id'], stdout=subprocess.DEVNULL)
+        print('Previous container restored. Backup: ' + str(backup), file=sys.stderr)
+        raise
+
+
+def main():
+    def interrupted(signum, frame):
+        raise RuntimeError('Update interrupted by signal ' + str(signum))
+    signal.signal(signal.SIGTERM, interrupted)
+    try:
+        update()
+    except (Exception, KeyboardInterrupt) as exc:
+        # Do not print subprocess arguments: they can contain private settings.
+        print('ERROR: ' + (str(exc) if not isinstance(exc, subprocess.CalledProcessError)
+                           else 'A required Docker/backup command failed.'), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
+
+IRSUPP_UPDATE_PYTHON
+)
+
 bot_update() {
-    if ! container_exists "$BOT_CONTAINER"; then
-        warn "The bot is not installed yet. Use Install first."
-        pause; return
-    fi
-    if [ ! -f "$BOT_ENV_FILE" ]; then
-        err "Configuration file not found (${BOT_ENV_FILE})."
-        err "Cannot update without existing config. Use Install / Reinstall instead."
-        pause; return
-    fi
-
-    warn "Update will pull the latest bot image and recreate the app container."
-    warn "Your settings (${BOT_ENV_FILE}) and database volume are kept."
-    warn "The database container is NOT touched."
-    local c
-    read -rp "$(echo -e "${Y}Proceed with update? (y/n): ${N}")" c
-    [ "$c" != "y" ] && { warn "Cancelled."; pause; return; }
-
-    info "Pulling latest bot image..."
-    docker pull "$BOT_IMAGE"
-
-    # make sure the database container is running (update only recreates the app)
-    if ! container_running "$BOT_DB_CONTAINER"; then
-        warn "Database container is not running — starting it..."
-        docker start "$BOT_DB_CONTAINER" >/dev/null 2>&1 || {
-            err "Could not start the database container. Aborting update."
-            pause; return
-        }
-        sleep 4
-    fi
-
-    info "Recreating the bot container with existing settings..."
-    docker rm -f "$BOT_CONTAINER" >/dev/null
-    docker run -d \
-        --name "$BOT_CONTAINER" \
-        --restart unless-stopped \
-        --network host \
-        --env-file "$BOT_ENV_FILE" \
-        "$BOT_IMAGE"
-
-    sleep 6
-    if container_running "$BOT_CONTAINER"; then
-        ok "Bot updated and running."
+    if safe_bot_update_112; then
+        ok "Updated to 1.1.2; verified backup path is shown above."
     else
-        err "Bot failed to start after update. Logs:"
-        docker logs "$BOT_CONTAINER" 2>&1 | tail -30
+        err "Update did not complete. Read the error above; do not reinstall."
     fi
     pause
 }
